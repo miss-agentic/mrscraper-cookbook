@@ -1,0 +1,36 @@
+{
+  "agent": "general",
+  "proxy_country": "US",
+
+  "fields": {
+    "product_name": "the product title",
+    "current_price": "number, digits only — the current selling price after any discount",
+    "original_price": "number, digits only — the list/strikethrough price before discount; null if none",
+    "currency": "the currency code shown, e.g. USD; null if not shown",
+    "in_stock": "true if the product can be purchased now, false if sold out or unavailable",
+    "product_url": "the canonical URL of this product page",
+    "seller": "the seller or retailer name if shown; null otherwise"
+  },
+
+  "retailers": [
+    {
+      "retailer": "Amazon",
+      "url": "https://www.amazon.com/Beats-Powerbeats-Wireless-Bluetooth-Earbuds/dp/B0DT2344N3",
+      "category": "headphones"
+    },
+    {
+      "retailer": "BestBuy",
+      "url": "https://www.bestbuy.com/product/beats-powerbeats-pro-2-true-wireless-active-noise-canceling-earbuds-jet-black/JJGCQ3FZLV",
+      "category": "headphones"
+    },
+    {
+      "retailer": "Walmart",
+      "url": "https://www.walmart.com/ip/Beats-Powerbeats-Pro-2-High-Performance-Earbuds-Jet-Black/15075506141",
+      "category": "headphones"
+    }
+  ],
+
+  "alerts": {
+    "threshold_pct": 5.0
+  }
+}
