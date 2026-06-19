@@ -6,6 +6,8 @@ name: "Price Monitor"
 # paths (the cache) are prefixed with price-monitoring/.
 
 on:
+  permissions:
+    contents: read
   schedule:
     - cron: "0 */6 * * *"          # every 6 hours (UTC)
   workflow_dispatch:               # manual "Run workflow" button
