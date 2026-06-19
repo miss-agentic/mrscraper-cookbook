@@ -6,6 +6,7 @@ the live scrape is monkeypatched, everything else is exercised for real.
     pytest -q
 """
 
+import asyncio
 import json
 
 import pytest
@@ -79,9 +80,48 @@ def test_normal_product_kept():
     ("$1,299.00", 1299.0), ("USD 249.99", 249.99), ("249", 249.0),
     ("0", None), ("-5", None), ("number, digits only", None),
     (100, 100.0), (99.99, 99.99), (0, None), (-1, None), (None, None),
+    # P0 fix 1: non-US formats are rejected, not mangled by 100-1000x.
+    ("1.299,00", None), ("169,99", None), ("1.234.567", None), (True, None),
 ])
 def test_price_parsing(raw, expected):
     assert m._to_price(raw) == expected
+
+
+# P0 fix 2: a currency flip must not produce a phantom price move.
+def test_currency_mismatch_no_phantom_move():
+    prev = {"u0": {"name": "X", "price": 5418.99, "currency": "TWD", "in_stock": True}}
+    curr = {"u0": {"name": "X", "price": 249.00, "currency": "USD", "in_stock": True}}
+    d = m.diff(prev, curr, TARGETS, 5.0)
+    assert d["events"] == []          # no garbage "drop"
+    assert d["unchanged"] == 1
+
+
+def test_same_currency_move_still_fires():
+    prev = {"u0": {"name": "X", "price": 100.0, "currency": "USD", "in_stock": True}}
+    curr = {"u0": {"name": "X", "price": 80.0, "currency": "USD", "in_stock": True}}
+    assert m.diff(prev, curr, TARGETS, 5.0)["events"][0]["type"] == "price_drop"
+
+
+# P0 fix 3: the nested marketplace schema is parsed, not dropped.
+def test_marketplace_schema_parsed():
+    nested = {
+        "product_info": {"name": "Galaxy A16"},
+        "price": {"current_price": 169.99, "currency": "USD"},
+        "stock_status": {"status": "in_stock"},
+    }
+    p = m._normalize(nested)
+    assert p is not None
+    assert p["name"] == "Galaxy A16" and p["price"] == 169.99 and p["in_stock"] is True
+
+
+def test_marketplace_out_of_stock_parsed():
+    nested = {
+        "product_info": {"name": "Sold Item"},
+        "price": {"current_price": 50.0, "currency": "USD"},
+        "stock_status": {"status": "out_of_stock"},
+    }
+    p = m._normalize(nested)
+    assert p["in_stock"] is False
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -266,3 +306,171 @@ def test_empty_retailers_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "CONFIG_PATH", f)
     with pytest.raises(SystemExit):
         m.main()
+
+
+# ---------------------------------------------------------------------------
+# Runtime path: _fetch_one / _scrape_all with a mocked SDK client.
+# These exercise the async scrape loop and per-product error isolation
+# without any network or token.
+# ---------------------------------------------------------------------------
+GOOD_ENV = {"data": {"data": {"data": {
+    "name": "Widget", "price": 10.0, "currency": "USD", "in_stock": True}}}}
+
+
+class _FakeClient:
+    """Stand-in for MrScraper: returns a scripted envelope per URL, or raises."""
+
+    def __init__(self, script):
+        self.script = script
+
+    async def create_scraper(self, url, message, agent, proxy_country):
+        beh = self.script.get(url, GOOD_ENV)
+        if isinstance(beh, Exception):
+            raise beh
+        return beh
+
+
+def test_fetch_one_sdk_errors_return_none():
+    pytest.importorskip("mrscraper")
+    from mrscraper.exceptions import APIError, AuthenticationError, NetworkError
+    for exc in (AuthenticationError("a"), APIError("b"), NetworkError("c")):
+        assert asyncio.run(m._fetch_one(_FakeClient({"u": exc}), "u", "US")) is None
+
+
+@pytest.mark.parametrize("env", [
+    {"success": False, "status": "Checking URL", "data": {"data": {"data": {}}}},
+    {}, None, [1, 2], "err", {"data": {"data": {}}},
+    {"data": {"data": {"data": {"name": None, "price": None, "currency": None, "in_stock": None}}}},
+])
+def test_fetch_one_malformed_envelope_returns_none(env):
+    pytest.importorskip("mrscraper")
+    assert asyncio.run(m._fetch_one(_FakeClient({"u": env}), "u", "US")) is None
+
+
+def test_scrape_all_isolates_every_failure_mode(monkeypatch):
+    mr = pytest.importorskip("mrscraper")
+    script = {"u0": GOOD_ENV, "u1": {"success": False, "data": {}},
+              "u2": Exception("generic sdk blowup"), "u3": TimeoutError("hang"),
+              "u4": GOOD_ENV}
+    monkeypatch.setattr(mr, "MrScraper", lambda token: _FakeClient(script))
+    monkeypatch.setenv("MRSCRAPER_API_TOKEN", "dummy")
+    out = asyncio.run(m._scrape_all(TARGETS[:5], "US"))
+    assert set(out) == {"u0", "u4"}  # good ones kept; all failures isolated, no crash
+
+
+# ---------------------------------------------------------------------------
+# Config validation and operational signal (regressions for stress-test finds).
+# ---------------------------------------------------------------------------
+def _cfg(tmp_path, obj):
+    f = tmp_path / "config.json"
+    f.write_text(json.dumps(obj))
+    return f
+
+
+def test_main_missing_url_exits_cleanly(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "CONFIG_PATH", _cfg(tmp_path, {"retailers": [{"retailer": "Amazon"}]}))
+    monkeypatch.setenv("MRSCRAPER_API_TOKEN", "dummy")
+    with pytest.raises(SystemExit):
+        m.main()
+
+
+def test_main_bad_threshold_type_exits_cleanly(tmp_path, monkeypatch):
+    cfg = {"retailers": [{"retailer": "R", "url": "u"}], "threshold_pct": "abc"}
+    monkeypatch.setattr(m, "CONFIG_PATH", _cfg(tmp_path, cfg))
+    monkeypatch.setenv("MRSCRAPER_API_TOKEN", "dummy")
+    with pytest.raises(SystemExit):
+        m.main()
+
+
+def test_main_negative_threshold_exits_cleanly(tmp_path, monkeypatch):
+    cfg = {"retailers": [{"retailer": "R", "url": "u"}], "threshold_pct": -1.0}
+    monkeypatch.setattr(m, "CONFIG_PATH", _cfg(tmp_path, cfg))
+    monkeypatch.setenv("MRSCRAPER_API_TOKEN", "dummy")
+    with pytest.raises(SystemExit):
+        m.main()
+
+
+def test_main_total_scrape_failure_exits_nonzero_and_keeps_state(tmp_path, monkeypatch):
+    mr = pytest.importorskip("mrscraper")
+    cfg = {"retailers": [{"retailer": "R", "url": "z"}], "threshold_pct": 5.0}
+    snap = tmp_path / "snap.json"
+    monkeypatch.setattr(m, "CONFIG_PATH", _cfg(tmp_path, cfg))
+    monkeypatch.setattr(m, "SNAPSHOT_PATH", snap)
+    monkeypatch.setattr(mr, "MrScraper", lambda token: _FakeClient({"z": {"success": False, "data": {}}}))
+    monkeypatch.setenv("MRSCRAPER_API_TOKEN", "dummy")
+    with pytest.raises(SystemExit) as ei:
+        m.main()
+    assert ei.value.code not in (0, None)   # loud failure, not a green run
+    assert not snap.exists()                # did not overwrite good state with nothing
+
+
+# ---------------------------------------------------------------------------
+# P1 hardening: per-request timeout and atomic snapshot write.
+# ---------------------------------------------------------------------------
+def test_fetch_one_times_out_returns_none(monkeypatch):
+    pytest.importorskip("mrscraper")
+    monkeypatch.setattr(m, "REQUEST_TIMEOUT_S", 0.05)
+
+    class _Hang:
+        async def create_scraper(self, **kw):
+            await asyncio.sleep(5)  # never completes within the timeout
+
+    # A hung scrape resolves to None (skipped), not an exception or a stall.
+    assert asyncio.run(m._fetch_one(_Hang(), "u", "US")) is None
+
+
+def _prod(name, price):
+    return {"name": name, "price": price, "currency": "USD", "in_stock": True}
+
+
+def test_save_snapshot_is_atomic_on_failure(tmp_path, monkeypatch):
+    snap = tmp_path / "data" / "snapshot.json"
+    monkeypatch.setattr(m, "SNAPSHOT_PATH", snap)
+    m.save_snapshot({"u": _prod("old", 1.0)})
+    before = snap.read_text()
+
+    def _boom(*a, **k):
+        raise OSError("simulated crash during replace")
+
+    monkeypatch.setattr(m.os, "replace", _boom)
+    with pytest.raises(OSError):
+        m.save_snapshot({"u": _prod("new", 2.0)})
+
+    # The original snapshot is untouched and still readable, not truncated.
+    assert snap.read_text() == before
+    assert m.load_snapshot()["u"]["name"] == "old"
+
+
+def test_save_snapshot_round_trip_after_atomic_change(tmp_path, monkeypatch):
+    snap = tmp_path / "data" / "snapshot.json"
+    monkeypatch.setattr(m, "SNAPSHOT_PATH", snap)
+    m.save_snapshot({"u": _prod("v1", 1.0)})
+    m.save_snapshot({"u": _prod("v2", 2.0)})  # second write replaces cleanly
+    assert m.load_snapshot()["u"]["price"] == 2.0
+    assert not snap.with_suffix(".json.tmp").exists()  # no temp left after success
+
+
+def test_demo_mode_uses_real_detection(capsys):
+    m.demo(pause=0)
+    out = capsys.readouterr().out
+    assert "🔍 Checking Tesla Model Y" in out
+    assert "Previous Price: $41,998" in out
+    assert "Current Price: $39,998" in out
+    assert "🚨 Price Change Detected" in out
+    assert "PRICE DROP" in out   # produced by the real diff() + format_summary()
+    assert "-4.8%" in out        # real computed percentage, not hardcoded
+
+
+# Plain-test coverage for the invariants the property tests proved (no hypothesis dep).
+@pytest.mark.parametrize("junk", [
+    None, True, False, "", "free", "N/A", "$", "abc", "1.2.3",
+    "199,00", "1.299,00", [], {}, -5, 0, "0", float("nan"),
+])
+def test_to_price_never_raises_and_is_safe(junk):
+    r = m._to_price(junk)
+    assert r is None or (isinstance(r, float) and r > 0)
+
+
+def test_identical_product_never_alerts_even_at_zero_threshold():
+    p = {"u0": {"name": "X", "price": 100.0, "currency": "USD", "in_stock": True}}
+    assert m.diff(p, dict(p), TARGETS, 0.0)["events"] == []

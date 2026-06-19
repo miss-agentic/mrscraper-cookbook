@@ -12,9 +12,6 @@ Run:
     pip install mrscraper-sdk python-dotenv
     cp .env.example .env          # paste your token
     python monitor.py             # first run = baseline, second run = first diff
-
-The MrScraper call shape here matches the verified SDK patterns. It is pending a
-live run against your account; the change-detection logic is covered by selftest.py.
 """
 
 from __future__ import annotations
@@ -22,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -35,6 +33,14 @@ except ImportError:
 
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "config.json"))
 SNAPSHOT_PATH = Path(os.environ.get("SNAPSHOT_PATH", "data/snapshot.json"))
+
+# US-formatted money only: "1299", "1299.99", "1,299", "1,299.00". Anything else
+# (decimal-comma locales, malformed grouping) is rejected rather than mis-parsed.
+_US_MONEY = re.compile(r"^\d{1,3}(,\d{3})*(\.\d+)?$|^\d+(\.\d+)?$")
+
+# Hard ceiling per scrape. Pages run ~30-75s; this stops a single hung request
+# from stalling the whole sequential run. Tune if your targets are slower.
+REQUEST_TIMEOUT_S = 180
 
 _TOKEN_HELP = (
     "MRSCRAPER_API_TOKEN is not set. Add it to .env (MRSCRAPER_API_TOKEN=atk_...) "
@@ -64,9 +70,15 @@ async def _fetch_one(client, url: str, proxy_country: str) -> dict | None:
     from mrscraper.exceptions import APIError, AuthenticationError, NetworkError
 
     try:
-        result = await client.create_scraper(
-            url=url, message=PROMPT, agent="general", proxy_country=proxy_country
+        result = await asyncio.wait_for(
+            client.create_scraper(
+                url=url, message=PROMPT, agent="general", proxy_country=proxy_country
+            ),
+            timeout=REQUEST_TIMEOUT_S,
         )
+    except asyncio.TimeoutError:
+        print(f"  ! scrape timed out after {REQUEST_TIMEOUT_S}s")
+        return None
     except (AuthenticationError, APIError, NetworkError) as e:
         print(f"  ! scrape failed: {e}")
         return None
@@ -109,9 +121,13 @@ def _extract_fields(result) -> dict | None:
 
 
 def _looks_like_product(d: dict) -> bool:
-    """True if the dict carries any field our prompt asks for (or a close alias)."""
+    """True if the dict carries any field our prompt asks for (or a close alias),
+    including the nested marketplace shape's top-level keys."""
     keys = {k.lower() for k in d.keys()}
-    return bool(keys & {"name", "price", "in_stock", "currency", "title", "product_name"})
+    return bool(keys & {
+        "name", "price", "in_stock", "currency", "title", "product_name",
+        "product_info", "stock_status", "current_price",
+    })
 
 
 def _shape(obj, depth: int = 0) -> str:
@@ -155,6 +171,29 @@ async def _scrape_all(targets: list[dict], proxy_country: str) -> dict[str, dict
     return out
 
 
+def _flatten_marketplace(raw: dict) -> dict:
+    """Some MrScraper paths (e.g. the Best Buy marketplace extractor) return a
+    richer nested shape: {product_info:{name}, price:{current_price, currency},
+    stock_status:{status}}. Map it onto our flat name/price/currency/in_stock so
+    the same diff logic works no matter which path produced the data. A flat
+    record passes through unchanged.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    price = raw.get("price")
+    is_nested = isinstance(price, dict) or "product_info" in raw or "stock_status" in raw
+    if not is_nested:
+        return raw
+    info = raw.get("product_info") if isinstance(raw.get("product_info"), dict) else {}
+    stock = raw.get("stock_status") if isinstance(raw.get("stock_status"), dict) else {}
+    return {
+        "name": info.get("name") or raw.get("name"),
+        "price": price.get("current_price") if isinstance(price, dict) else price,
+        "currency": price.get("currency") if isinstance(price, dict) else raw.get("currency"),
+        "in_stock": stock.get("status") if stock else raw.get("in_stock"),
+    }
+
+
 def _normalize(raw: dict) -> dict | None:
     """Coerce loose field types into a stable shape, or return None for a
     blocked/empty render so it isn't stored as a real product.
@@ -164,6 +203,7 @@ def _normalize(raw: dict) -> dict | None:
     failed scrape, not a product. That stops a blank/blocked page from
     overwriting good snapshot data or firing a phantom alert next run.
     """
+    raw = _flatten_marketplace(raw)
     name = str(raw.get("name") or "").strip()
     price = _to_price(raw.get("price"))
     in_stock, explicit_stock = _to_bool(raw.get("in_stock"))
@@ -183,18 +223,24 @@ def _normalize(raw: dict) -> dict | None:
 
 
 def _to_price(value) -> float | None:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, (int, float)):
         return float(value) if value > 0 else None
     if isinstance(value, str):
-        cleaned = value.replace(",", "")
-        for ch in ("$", "€", "£", "¥", "USD", "US"):
+        cleaned = value
+        for ch in ("$", "€", "£", "¥", "USD", "US", "\u00a0"):
             cleaned = cleaned.replace(ch, "")
         cleaned = cleaned.strip()
-        try:
-            n = float(cleaned)
-            return n if n > 0 else None
-        except ValueError:
-            return None  # e.g. the model echoed the field description on a blocked page
+        # We pin proxy_country="US", so prices come back US-formatted (comma =
+        # thousands, dot = decimal). Only trust that exact shape. Anything else,
+        # like the decimal-comma "1.299,00", is rejected rather than silently
+        # mangled into a wrong-by-1000x number. A rejected value reads as "no
+        # data" and is reported, which is far safer than a fabricated price.
+        if not _US_MONEY.match(cleaned):
+            return None
+        n = float(cleaned.replace(",", ""))
+        return n if n > 0 else None
     return None
 
 
@@ -204,7 +250,7 @@ def _to_bool(value) -> tuple[bool, bool]:
     if isinstance(value, bool):
         return value, True
     if isinstance(value, str):
-        v = value.lower().strip()
+        v = value.lower().strip().replace("_", " ")  # so "out_of_stock" reads as "out of stock"
         if any(k in v for k in ("out of stock", "sold out", "unavailable", "false", "no")):
             return False, True
         if any(k in v for k in ("in stock", "available", "true", "add to cart", "buy")):
@@ -241,9 +287,12 @@ def diff(previous: dict, current: dict, targets: list[dict], threshold_pct: floa
             events.append(_event("back_in_stock", url, label, curr, prev))
             continue
 
-        # Price move — only when we have real numbers on both sides.
+        # Price move — only when we have real numbers on both sides AND the
+        # currency is the same. A currency flip (locale drift) would otherwise
+        # compare unlike units and report a garbage percentage.
         old_p, new_p = prev.get("price"), curr.get("price")
-        if old_p and new_p:
+        same_currency = prev.get("currency") == curr.get("currency")
+        if old_p and new_p and same_currency and new_p != old_p:
             pct = (new_p - old_p) / old_p * 100
             if abs(pct) >= threshold_pct:
                 kind = "price_drop" if pct < 0 else "price_increase"
@@ -328,13 +377,53 @@ def load_snapshot() -> dict:
 
 def save_snapshot(products: dict) -> None:
     SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SNAPSHOT_PATH.write_text(
-        json.dumps(
-            {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-             "products": products},
-            indent=2,
-        )
+    payload = json.dumps(
+        {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+         "products": products},
+        indent=2,
     )
+    # Write to a temp file in the same directory, then atomically replace. A
+    # crash mid-write leaves the previous snapshot intact instead of a
+    # truncated, unreadable file.
+    tmp = SNAPSHOT_PATH.with_suffix(SNAPSHOT_PATH.suffix + ".tmp")
+    tmp.write_text(payload)
+    os.replace(tmp, SNAPSHOT_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Demo mode: `python monitor.py --demo`
+# Narrates the alert flow on staged data, but runs the REAL diff() detection and
+# the real summary renderer, so what's on screen is the genuine logic, not
+# hardcoded prints. No token, no network, deterministic for recording. It never
+# touches the live snapshot.
+# ---------------------------------------------------------------------------
+DEMO_THRESHOLD_PCT = 3.0  # the staged $2,000 drop is ~4.8%, which clears this
+DEMO_TARGETS = [{"retailer": "Demo", "url": "demo://tesla-model-y"}]
+DEMO_PREVIOUS = {"demo://tesla-model-y":
+                 {"name": "Tesla Model Y", "price": 41998.0, "currency": "USD", "in_stock": True}}
+DEMO_CURRENT = {"demo://tesla-model-y":
+                {"name": "Tesla Model Y", "price": 39998.0, "currency": "USD", "in_stock": True}}
+
+
+def demo(pause: float = 0.5) -> None:
+    print("DEMO MODE — staged prices, real detection logic\n")
+    for t in DEMO_TARGETS:
+        prev, curr = DEMO_PREVIOUS[t["url"]], DEMO_CURRENT[t["url"]]
+        print(f"🔍 Checking {curr['name']}...")
+        time.sleep(pause)
+        print(f"💰 Previous Price: ${prev['price']:,.0f}")
+        print(f"💰 Current Price: ${curr['price']:,.0f}")
+        time.sleep(pause)
+
+    result = diff(DEMO_PREVIOUS, DEMO_CURRENT, DEMO_TARGETS, DEMO_THRESHOLD_PCT)
+    if result["events"]:
+        print("🚨 Price Change Detected")
+        time.sleep(pause)
+        print("📣 Generating Alert...\n")
+        time.sleep(pause)
+        print(format_summary(result))
+    else:
+        print("✅ No change above threshold.")
 
 
 def main() -> None:
@@ -348,8 +437,16 @@ def main() -> None:
     targets = config.get("retailers")
     if not isinstance(targets, list) or not targets:
         sys.exit("config.json needs a non-empty 'retailers' list. See the README for the shape.")
+    for i, t in enumerate(targets, 1):
+        if not isinstance(t, dict) or not isinstance(t.get("url"), str) or not t["url"].strip():
+            sys.exit(f"config.json: retailer #{i} is missing a valid 'url'. Each entry needs a product URL.")
     proxy_country = config.get("proxy_country", "US")
-    threshold = float(config.get("threshold_pct", 5.0))
+    try:
+        threshold = float(config.get("threshold_pct", 5.0))
+    except (TypeError, ValueError):
+        sys.exit("config.json: 'threshold_pct' must be a number, e.g. 5.0 for 5%.")
+    if threshold < 0:
+        sys.exit("config.json: 'threshold_pct' must be zero or positive.")
 
     if not os.environ.get("MRSCRAPER_API_TOKEN"):
         sys.exit(_TOKEN_HELP)
@@ -366,6 +463,14 @@ def main() -> None:
     print(summary)
     write_github_summary(summary)
 
+    if not current:
+        # Every scrape failed. Don't overwrite good state, and fail loudly so a
+        # scheduled run can't go green while reading nothing real.
+        sys.exit(
+            f"All {len(targets)} scrape(s) failed this run — no usable data. "
+            "Check the token, network, or whether the targets are blocking."
+        )
+
     # Carry forward last-known state for any product that didn't return this run,
     # so one transient empty render doesn't look like a change next time.
     merged = {**previous, **current}
@@ -373,4 +478,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--demo" in sys.argv:
+        demo()
+    else:
+        main()
