@@ -52,12 +52,11 @@ _TOKEN_HELP = (
 PROMPT = (
     "Extract this product. Return ONLY a JSON object with exactly these keys, "
     "and use null for anything not shown on the page. Do not guess.\n"
-    "{\n"
-    '  "name": "the product title",\n'
-    '  "price": "current selling price as a number, digits only, after any discount; null if not shown",\n'
-    '  "currency": "currency code shown, e.g. USD; null if not shown",\n'
-    '  "in_stock": "true if it can be bought now, false if sold out or unavailable"\n'
-    "}\n"
+    '{ "name": "the product title", '
+    '"price": "current selling price after any discount, as a decimal number in dollars with cents kept, '
+    'for example 295.00 or 1299.99, no currency symbol; null if not shown", '
+    '"currency": "currency code shown, e.g. USD; null if not shown", '
+    '"in_stock": "true if it can be bought now, false if sold out or unavailable" }\n'
     "Return JSON only. No markdown, no commentary."
 )
 
@@ -262,6 +261,13 @@ def _to_bool(value) -> tuple[bool, bool]:
 # ---------------------------------------------------------------------------
 # Diff: compare this run against the last snapshot, by URL.
 # ---------------------------------------------------------------------------
+# An order-of-magnitude price move in either direction is almost always a data
+# error (a dropped decimal read 295.00 -> 29500, a mis-scraped figure), not a
+# real sale. We quarantine those instead of alerting. Real retail discounts top
+# out well under 10x, so this won't suppress a genuine clearance.
+SANITY_RATIO = 10.0
+
+
 def diff(previous: dict, current: dict, targets: list[dict], threshold_pct: float) -> dict:
     """Compare two {url: product} maps. Returns events + an unchanged count.
 
@@ -293,6 +299,14 @@ def diff(previous: dict, current: dict, targets: list[dict], threshold_pct: floa
         old_p, new_p = prev.get("price"), curr.get("price")
         same_currency = prev.get("currency") == curr.get("currency")
         if old_p and new_p and same_currency and new_p != old_p:
+            # Sanity guard: an order-of-magnitude jump in either direction is a
+            # data error, not a real price move. Quarantine it as suspect rather
+            # than fire a confident fake alert. The prompt makes this rarer; this
+            # bounds the damage when the LLM inevitably drifts again.
+            if max(new_p / old_p, old_p / new_p) >= SANITY_RATIO:
+                events.append(_event("suspect_data", url, label, curr, prev,
+                                     (new_p - old_p) / old_p * 100))
+                continue
             pct = (new_p - old_p) / old_p * 100
             if abs(pct) >= threshold_pct:
                 kind = "price_drop" if pct < 0 else "price_increase"
@@ -322,6 +336,7 @@ HEADERS = {
     "price_increase": "PRICE INCREASE",
     "out_of_stock": "OUT OF STOCK",
     "back_in_stock": "BACK IN STOCK",
+    "suspect_data": "SUSPECT DATA — not alerted",
 }
 SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥"}
 
@@ -336,12 +351,17 @@ def format_summary(result: dict, missing: int = 0) -> str:
     lines = ["Run Summary", ""]
 
     for e in events:
-        lines.append(f"🔔 {HEADERS[e['type']]}")
+        bell = "⚠️" if e["type"] == "suspect_data" else "🔔"
+        lines.append(f"{bell} {HEADERS[e['type']]}")
         lines.append(f"{e['name']} ({e['retailer']})")
         if e["type"] in ("price_drop", "price_increase"):
             old_s = _money(e["currency"], e["old_price"])
             new_s = _money(e["currency"], e["new_price"])
             lines.append(f"{old_s} → {new_s}  ({e['pct']:+.1f}%)")
+        elif e["type"] == "suspect_data":
+            old_s = _money(e["currency"], e["old_price"])
+            new_s = _money(e["currency"], e["new_price"])
+            lines.append(f"{old_s} → {new_s}  ({e['pct']:+.1f}%) — implausible jump, skipped. Check the scrape, not the price.")
         lines.append("")
 
     word = "other " if events else ""
@@ -397,29 +417,36 @@ def save_snapshot(products: dict) -> None:
 # hardcoded prints. No token, no network, deterministic for recording. It never
 # touches the live snapshot.
 # ---------------------------------------------------------------------------
-DEMO_THRESHOLD_PCT = 3.0  # the staged $2,000 drop is ~4.8%, which clears this
-DEMO_TARGETS = [{"retailer": "Demo", "url": "demo://tesla-model-y"}]
-DEMO_PREVIOUS = {"demo://tesla-model-y":
-                 {"name": "Tesla Model Y", "price": 41998.0, "currency": "USD", "in_stock": True}}
-DEMO_CURRENT = {"demo://tesla-model-y":
-                {"name": "Tesla Model Y", "price": 39998.0, "currency": "USD", "in_stock": True}}
+DEMO_THRESHOLD_PCT = 5.0  # same as the production default — the demo shows real behavior, not a lowered bar
+DEMO_TARGETS = [
+    {"retailer": "Newegg", "url": "demo://rtx-5070"},
+    {"retailer": "Amazon", "url": "demo://990-pro-2tb"},
+]
+DEMO_PREVIOUS = {
+    "demo://rtx-5070":    {"name": "ASUS PRIME GeForce RTX 5070 12GB", "price": 649.99, "currency": "USD", "in_stock": True},
+    "demo://990-pro-2tb": {"name": "Samsung 990 PRO SSD 2TB NVMe",     "price": 389.99, "currency": "USD", "in_stock": True},
+}
+DEMO_CURRENT = {
+    "demo://rtx-5070":    {"name": "ASUS PRIME GeForce RTX 5070 12GB", "price": 549.99, "currency": "USD", "in_stock": True},   # -15.4%: the hero drop
+    "demo://990-pro-2tb": {"name": "Samsung 990 PRO SSD 2TB NVMe",     "price": 389.99, "currency": "USD", "in_stock": True},   # unchanged: exercises the "N others" line
+}
 
 
 def demo(pause: float = 0.5) -> None:
     print("DEMO MODE — staged prices, real detection logic\n")
     for t in DEMO_TARGETS:
         prev, curr = DEMO_PREVIOUS[t["url"]], DEMO_CURRENT[t["url"]]
-        print(f"🔍 Checking {curr['name']}...")
+        print(f"🔍 Checking {curr['name']} ({t['retailer']})...")
         time.sleep(pause)
-        print(f"💰 Previous Price: ${prev['price']:,.0f}")
-        print(f"💰 Current Price: ${curr['price']:,.0f}")
+        was = _money(prev["currency"], prev["price"])
+        now = _money(curr["currency"], curr["price"])
+        print(f"   was {was}  →  now {now}")
         time.sleep(pause)
 
     result = diff(DEMO_PREVIOUS, DEMO_CURRENT, DEMO_TARGETS, DEMO_THRESHOLD_PCT)
+    print()
     if result["events"]:
-        print("🚨 Price Change Detected")
-        time.sleep(pause)
-        print("📣 Generating Alert...\n")
+        print("🚨 Change detected\n")
         time.sleep(pause)
         print(format_summary(result))
     else:
@@ -462,6 +489,16 @@ def main() -> None:
     summary = format_summary(result, missing=missing)
     print(summary)
     write_github_summary(summary)
+
+    # Surface quarantined values as a CI warning so a run with suspect data can't
+    # slip by unnoticed in a sea of green. We don't fail the run on it — the rest
+    # of the products are still valid — but the annotation makes it impossible to
+    # miss, and keeps a fabricated number off the recorded demo.
+    suspects = [e for e in result["events"] if e["type"] == "suspect_data"]
+    if suspects and os.environ.get("GITHUB_ACTIONS"):
+        for e in suspects:
+            print(f"::warning title=Suspect price data::{e['name']} ({e['retailer']}) "
+                  f"moved {e['pct']:+.0f}% — quarantined, not alerted. Re-check the scrape.")
 
     if not current:
         # Every scrape failed. Don't overwrite good state, and fail loudly so a
