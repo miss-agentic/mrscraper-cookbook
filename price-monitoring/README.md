@@ -33,7 +33,7 @@ That runs the real change-detection logic against staged data and prints a full 
 
 ## Who it's for
 
-Ecommerce operators watching competitor or own-catalog prices, founders tracking a few SKUs, and developers who want a price/stock feed for a dashboard, alert, or LLM workflow. You do not need to write application code to run it. *You do need to use the terminal, paste URLs into `config.json`, and add your API token.*
+Ecommerce operators watching competitor/own-catalog prices, founders tracking a few SKUs, and developers who want a price/stock feed for a dashboard, alert, or LLM workflow. You do not need to write application code to run it. *You do need to use the terminal, paste URLs into `config.json`, and add your API token.*
 
 ## When to use it
 
