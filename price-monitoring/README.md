@@ -72,7 +72,7 @@ python monitor.py             # first run = baseline; run again later for the fi
 
 ## Cost
 
-MrScraper's free tier includes 100 tokens. The offline paths (`--demo`, `selftest.py`, `pytest`) spend none of them, so you can preview the alert format and test the change-detection logic for free.
+MrScraper's free tier includes 1000 tokens. The offline paths (`--demo`, `selftest.py`, `pytest`) spend none of them, so you can preview the alert format and test the change-detection logic for free.
 
 Live runs spend tokens. MrScraper bills one token per 30 seconds of runtime, and these product pages take roughly 30–75 seconds each, so a single scrape runs about one to three tokens. The default `config.json` tracks 11 products on a 6-hour schedule — 44 scrapes a day, very roughly 50–130 tokens. Failed scrapes aren't billed, so a blocked page costs you nothing.
 
@@ -176,15 +176,6 @@ gh workflow run price-monitor.yml
 ```
 
 That needs the GitHub CLI and a `workflow_dispatch:` trigger in the workflow's `on:` block (included here).
-
-## Common pitfalls
-
-- **Wrong-locale prices.** Without `proxy_country`, a US product can come back in TWD or EUR. Set it.
-- **Decimal-comma prices read as ×100.** Even with `proxy_country="US"`, the upstream agent occasionally returns a price like `199,00` instead of `199.00`. A naive parser that strips commas turns that into `19900`, and the next run reports a fake +9900% spike. This recipe parses US money formats only and rejects anything else, so a mis-formatted price reads as no-price for that run instead of a phantom alert. A missed reading is recoverable. A fabricated number that triggers an alert is not.
-- **Out-of-stock pages hide the price.** When that happens, `price` is null. This recipe still records the product and still reports the stock transition. (The earlier database version dropped any record with no price, so out-of-stock events with hidden prices were silently missed. Fixed here by keying on URL and treating stock and price independently.)
-- **Blocked or blank renders.** A site occasionally returns nothing usable. That product is skipped for the run and keeps its last-known snapshot value, so one bad render doesn't fake a change next time. The run reports it as `Could not read N product(s)`. Confirm your targets render reliably on MrScraper Playground before you rely on them.
-- **First run never alerts.** It is the baseline. You need two runs to get a diff. On a 6-hour schedule that means alerts can't appear until the second scheduled run (about 6 hours in). If you want a populated summary on the first morning, run `monitor.py` once locally before the schedule starts.
-- **A poisoned snapshot persists.** State carries between runs (a cached snapshot in CI). If a bad value ever lands in it, clear the cache and lay a fresh baseline; a single re-run against the same state reproduces the same bad diff.
 
 ## License
 
