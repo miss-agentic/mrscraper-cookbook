@@ -41,7 +41,7 @@ When you care about *change over time* on pages you don't control: a competitor 
 
 ## What you need
 
-1. A free MrScraper account. Sign up at https://app.mrscraper.com and copy your API token from the dashboard. The free tier includes 100 tokens — enough to learn the recipe and watch it run (see Cost below).
+1. A free MrScraper account. Sign up at https://app.mrscraper.com and copy your API token from the dashboard. The free tier includes 1000 tokens — enough to learn the recipe and watch it run (see Cost below).
 2. Python 3.10+.
 3. The SDK and one helper, installed from `requirements.txt`:
 
@@ -72,7 +72,7 @@ python monitor.py             # first run = baseline; run again later for the fi
 
 ## Cost
 
-MrScraper's free tier includes 100 tokens. The offline paths (`--demo`, `selftest.py`, `pytest`) spend none of them, so you can preview the alert format and test the change-detection logic for free.
+MrScraper's free tier includes 1000 tokens. The offline paths (`--demo`, `selftest.py`, `pytest`) spend none of them, so you can preview the alert format and test the change-detection logic for free.
 
 Live runs spend tokens. MrScraper bills one token per 30 seconds of runtime, and these product pages take roughly 30–75 seconds each, so a single scrape runs about one to three tokens. The default `config.json` tracks 11 products on a 6-hour schedule — 44 scrapes a day, very roughly 50–130 tokens. Failed scrapes aren't billed, so a blocked page costs you nothing.
 
