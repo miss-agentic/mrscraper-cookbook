@@ -41,7 +41,7 @@ When you care about *change over time* on pages you don't control: a competitor 
 
 ## What you need
 
-1. A free MrScraper account. Sign up at https://app.mrscraper.com and copy your API token from the dashboard. The free tier includes 100 tokens — enough to learn the recipe and watch it run (see Cost below).
+1. A free MrScraper account. Sign up at https://app.mrscraper.com and copy your API token from the dashboard. The free tier includes 1000 tokens — enough to learn the recipe and watch it run (see Cost below).
 2. Python 3.10+.
 3. The SDK and one helper, installed from `requirements.txt`:
 
